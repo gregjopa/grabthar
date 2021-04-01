@@ -64,12 +64,15 @@ export const info = memoizePromise(async (moduleName : string, opts : InfoOption
 
     const cacheKey = `grabthar_npm_info_${ sanitizedName }_${ sanitizedCDNRegistry }`;
 
-    const { name, versions, 'dist-tags': distTags } = await cacheReadWrite(cacheKey, async () => {
+    const { name, versions, 'dist-tags': distTags, fetchedFromCDNRegistry } = await cacheReadWrite(cacheKey, async () => {
         let res;
+        let usedCDNRegistry = false;
 
         if (cdnRegistry) {
             res = await fetch(`${ cdnRegistry }/${ moduleName.replace('@', '') }/${ CDN_REGISTRY_INFO_FILENAME }?cache-bust=${ Math.floor(Date.now() / CDN_REGISTRY_INFO_CACHEBUST_URL_TIME) }`);
-            if (!res.ok) {
+            if (res.ok) {
+                usedCDNRegistry = true;
+            } else {
                 logger.warn(`grabthar_cdn_registry_failure`, {
                     cdnRegistry, moduleName, status: res.status
                 });
@@ -85,9 +88,27 @@ export const info = memoizePromise(async (moduleName : string, opts : InfoOption
             throw new Error(`npm returned status ${ res.status || 'unknown' } for ${ registry }/${ moduleName }`);
         }
 
-        return extractInfo(await res.json());
+        const extractedInfo = extractInfo(await res.json());
+
+        return {
+            ...extractedInfo,
+            fetchedFromCDNRegistry: usedCDNRegistry
+        };
 
     }, { logger, cache });
+
+    if (cdnRegistry && fetchedFromCDNRegistry) {
+        for (const version of Object.keys(versions)) {
+            const { dist: { tarball } } = versions[version];
+            if (!tarball.includes(cdnRegistry)) {
+                const initialTarballPathname = new URL(tarball).pathname;
+                const newTarballOrigin = new URL(cdnRegistry).origin;
+                versions[version].dist.tarball = new URL(initialTarballPathname, newTarballOrigin).toString();
+            }
+        }
+
+        logger.info(`grabthar_npm_info_update_tarballs_to_use_cdn_registry`, { cdnRegistry });
+    }
 
     return { name, versions, 'dist-tags': distTags };
 }, { lifetime: INFO_MEMORY_CACHE_LIFETIME });
@@ -117,34 +138,18 @@ export const installSingle = memoizePromise(async (moduleName : string, version 
         throw new Error(`No version found for ${ moduleName } @ ${ version } - found ${ Object.keys(moduleInfo.versions).join(', ') }`);
     }
 
-    const initialTarball = versionInfo.dist.tarball;
-
     if (!prefix) {
         throw new Error(`Prefix required for flat install`);
     }
 
-    if (!initialTarball) {
+    const tarball = versionInfo.dist.tarball;
+
+    if (!tarball) {
         throw new Error(`Can not find tarball for ${ moduleInfo.name }`);
     }
 
     const nodeModulesDir = join(prefix, NODE_MODULES);
     const packageName = `${ PACKAGE }.tar.gz`;
-    let tarball = initialTarball;
-
-    if (cdnRegistry && !tarball.includes(cdnRegistry)) {
-        try {
-            const initialTarballPathname = new URL(initialTarball).pathname;
-            const newTarballOrigin = new URL(cdnRegistry).origin;
-            tarball = new URL(initialTarballPathname, newTarballOrigin).toString();
-
-        } catch (err) {
-            throw new Error(`Failed to parse tarball url ${ tarball }\n\n${ err.stack }`);
-        }
-
-
-        logger.info(`grabthar_npm_install_dependency_update_tarball_location`, { cdnRegistry, oldTarball: initialTarball, newTarball: tarball });
-    }
-
     const tmpDir = await getTemporaryDirectory(moduleName);
     const packageDir = join(tmpDir, PACKAGE);
     const moduleDir = join(nodeModulesDir, moduleInfo.name);
